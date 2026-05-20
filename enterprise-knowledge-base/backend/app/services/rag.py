@@ -11,7 +11,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.models import ChunkRecord, Document, KnowledgeBase
-from app.services import embeddings as emb_svc
 from app.services import vector_store as vs
 from app.services.reranker import rerank_documents
 
@@ -45,6 +44,16 @@ async def load_kb_chunks(
     return ids, texts, meta
 
 
+def _norm_scores(d: dict[str, float]) -> dict[str, float]:
+    """Min-max normalize a score dict. Returns empty dict for empty input."""
+    if not d:
+        return {}
+    lo, hi = min(d.values()), max(d.values())
+    if hi - lo < 1e-9:
+        return {k: 1.0 for k in d}
+    return {k: (v - lo) / (hi - lo) for k, v in d.items()}
+
+
 async def hybrid_search(
     db: AsyncSession,
     kb_id: str,
@@ -52,89 +61,81 @@ async def hybrid_search(
     top_k: int = 15,
     vector_weight: float = 0.65,
 ) -> list[dict[str, Any]]:
+    """Two-stage hybrid retrieval: vector search + BM25 keyword search, with score fusion.
+
+    Stage 1 – Vector recall: retrieves a larger pool via embedding similarity.
+    Stage 2 – BM25: scores the full corpus for keyword match, then fuses normalized
+              scores from both sources via weighted sum.
+    Stage 3 – Optional rerank: applies cross-encoder reranker when enabled.
+    """
     kb = await db.get(KnowledgeBase, kb_id)
     if not kb:
         return []
-    # 初始召回
-    initial_hits = await vs.search(kb_id, query, top_k=kb.search_top_k if kb.search_top_k else top_k)
-    if not initial_hits:
+
+    effective_top_k = kb.search_top_k or top_k
+    pool_size = max(effective_top_k * 4, 20)
+
+    # ── Stage 1: Vector recall ──────────────────────────────────────────
+    vector_hits = await vs.search(kb_id, query, top_k=pool_size)
+    if not vector_hits:
         return []
 
-    # Rerank
-    final_hits = initial_hits
-    if kb.use_rerank:
-        final_hits = await rerank_documents(
-                query, 
-                initial_hits, 
-                top_n = kb.rerank_top_k
-            )
-    else:
-        final_hits = initial_hits[:top_k]
-    # 返回最终结果
-    return final_hits
-    '''
-    model = kb.embedding_model_id
-    query_vec = (await emb_svc.embed_texts([query], model=model))[0]
-    vec_raw = vs.query_vectors(kb_id, query_vec, top_k=max(top_k * 4, 20))
-    vec_ids = vec_raw["ids"][0] if vec_raw.get("ids") else []
-    vec_dist = vec_raw["distances"][0] if vec_raw.get("distances") else []
+    # ── Stage 2: BM25 + score fusion ────────────────────────────────────
+    all_ids, all_texts, all_metas = await load_kb_chunks(db, kb_id)
+    if not all_texts:
+        return vector_hits[:effective_top_k]
 
-    vec_scores: dict[str, float] = {}
-    for i, cid in enumerate(vec_ids):
-        d = float(vec_dist[i]) if i < len(vec_dist) else 1.0
-        sim = 1.0 / (1.0 + d)
-        vec_scores[cid] = sim
+    tokenized_corpus = [_tokenize(t) for t in all_texts]
+    bm25 = BM25Okapi(tokenized_corpus)
+    bm_scores = bm25.get_scores(_tokenize(query))
 
-    id_list, texts, _metas = await load_kb_chunks(db, kb_id)
-    if not texts:
-        return []
+    bm25_map: dict[str, float] = {
+        all_ids[i]: float(bm_scores[i]) for i in range(len(all_ids))
+    }
+    vec_map: dict[str, float] = {h["chunk_id"]: h["score"] for h in vector_hits}
 
-    tokenized = [_tokenize(t) for t in texts]
-    bm25 = BM25Okapi(tokenized)
-    q_tokens = _tokenize(query)
-    bm_scores = bm25.get_scores(q_tokens)
-    bm_map: dict[str, float] = {}
-    for i, cid in enumerate(id_list):
-        if i < len(bm_scores):
-            bm_map[cid] = float(bm_scores[i])
+    n_vec = _norm_scores(vec_map)
+    n_bm = _norm_scores(bm25_map)
 
-    def norm_dict(d: dict[str, float]) -> dict[str, float]:
-        if not d:
-            return {}
-        lo, hi = min(d.values()), max(d.values())
-        if hi - lo < 1e-9:
-            return {k: 1.0 for k in d}
-        return {k: (v - lo) / (hi - lo) for k, v in d.items()}
-
-    n_vec = norm_dict(vec_scores)
-    n_bm = norm_dict(bm_map)
-    all_ids = set(n_vec) | set(n_bm)
+    candidate_ids = set(n_vec.keys()) | set(n_bm.keys())
     fused: dict[str, float] = {}
-    for cid in all_ids:
+    for cid in candidate_ids:
         fused[cid] = vector_weight * n_vec.get(cid, 0.0) + (1 - vector_weight) * n_bm.get(cid, 0.0)
 
-    ranked = sorted(fused.items(), key=lambda x: x[1], reverse=True)[:top_k]
+    ranked = sorted(fused.items(), key=lambda x: x[1], reverse=True)[:effective_top_k]
+
+    # ── Build output ────────────────────────────────────────────────────
+    doc_ids = {m.get("document_id", "") for m in all_metas if m.get("document_id")}
+    doc_map: dict[str, str] = {}
+    if doc_ids:
+        doc_rows = (await db.execute(select(Document).where(Document.id.in_(list(doc_ids))))).scalars().all()
+        doc_map = {d.id: d.filename for d in doc_rows}
+
+    text_lookup = {all_ids[i]: all_texts[i] for i in range(len(all_ids))}
+    meta_lookup = {all_ids[i]: all_metas[i] for i in range(len(all_ids))}
+
     out: list[dict[str, Any]] = []
     for cid, score in ranked:
-        chunk = await db.get(ChunkRecord, cid)
-        if not chunk:
-            continue
-        doc = await db.get(Document, chunk.document_id)
+        meta = meta_lookup.get(cid, {})
         out.append(
             {
                 "chunk_id": cid,
-                "content": chunk.content,
+                "content": text_lookup.get(cid, ""),
                 "score": round(score, 4),
                 "metadata": {
-                    "source": doc.filename if doc else "",
-                    "document_id": chunk.document_id,
-                    "page": chunk.page,
-                    "heading_path": chunk.heading_path,
+                    "source": doc_map.get(meta.get("document_id", ""), ""),
+                    "document_id": meta.get("document_id", ""),
+                    "page": meta.get("page"),
+                    "heading_path": meta.get("heading_path", ""),
                 },
             }
         )
+
+    # ── Stage 3: Rerank ─────────────────────────────────────────────────
+    if kb.use_rerank and out:
+        out = await rerank_documents(query, out, top_n=kb.rerank_top_k or effective_top_k)
+
     return out
-    '''
 
 SYSTEM_PROMPT = """你是企业知识库助手。请仅根据「参考资料」回答问题。
 若参考资料不足以回答，请明确说明「根据现有资料无法回答」，不要编造条款或出处。
