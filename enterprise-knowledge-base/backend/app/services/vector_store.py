@@ -53,6 +53,41 @@ def query_vectors(kb_id: str, query_embedding: list[float], top_k: int) -> dict[
     )
 
 
+async def search(kb_id: str, query: str, top_k: int) -> list[dict[str, Any]]:
+    """Embed query and return top-k results from the vector store."""
+    from app.services import embeddings as emb_svc
+
+    settings = get_settings()
+    model = settings.embedding_model
+    query_vec = (await emb_svc.embed_texts([query], model=model))[0]
+    col = get_collection(kb_id)
+    raw = col.query(
+        query_embeddings=[query_vec],
+        n_results=top_k,
+        include=["documents", "metadatas", "distances"],
+    )
+    out: list[dict[str, Any]] = []
+    ids = raw.get("ids", [[]])[0]
+    docs = raw.get("documents", [[]])[0]
+    metas = raw.get("metadatas", [[]])[0]
+    dists = raw.get("distances", [[]])[0]
+    for i, cid in enumerate(ids):
+        d = float(dists[i]) if i < len(dists) else 1.0
+        score = round(1.0 / (1.0 + d), 4)
+        meta = dict(metas[i]) if i < len(metas) else {}
+        if "source" not in meta:
+            meta["source"] = meta.get("filename", "")
+        out.append(
+            {
+                "chunk_id": cid,
+                "content": docs[i] if i < len(docs) else "",
+                "score": score,
+                "metadata": meta,
+            }
+        )
+    return out
+
+
 def delete_collection(kb_id: str) -> None:
     client = _client()
     try:

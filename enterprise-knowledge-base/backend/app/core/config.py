@@ -27,6 +27,8 @@ class Settings(BaseSettings):
 
     embedding_model: str = "Qwen/Qwen3-Embedding-8B"
 
+    reranker_model: str = "BAAI/bge-reranker-v2-m3"
+
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
 
     @property

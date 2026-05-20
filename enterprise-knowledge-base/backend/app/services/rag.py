@@ -13,7 +13,7 @@ from app.core.config import get_settings
 from app.models import ChunkRecord, Document, KnowledgeBase
 from app.services import embeddings as emb_svc
 from app.services import vector_store as vs
-
+from app.services.reranker import rerank_documents
 
 def _tokenize(text: str) -> list[str]:
     return [t for t in "".join(ch if ch.isalnum() else " " for ch in text.lower()).split() if t]
@@ -49,12 +49,30 @@ async def hybrid_search(
     db: AsyncSession,
     kb_id: str,
     query: str,
-    top_k: int = 8,
+    top_k: int = 15,
     vector_weight: float = 0.65,
 ) -> list[dict[str, Any]]:
     kb = await db.get(KnowledgeBase, kb_id)
     if not kb:
         return []
+    # 初始召回
+    initial_hits = await vs.search(kb_id, query, top_k=kb.search_top_k if kb.search_top_k else top_k)
+    if not initial_hits:
+        return []
+
+    # Rerank
+    final_hits = initial_hits
+    if kb.use_rerank:
+        final_hits = await rerank_documents(
+                query, 
+                initial_hits, 
+                top_n = kb.rerank_top_k
+            )
+    else:
+        final_hits = initial_hits[:top_k]
+    # 返回最终结果
+    return final_hits
+    '''
     model = kb.embedding_model_id
     query_vec = (await emb_svc.embed_texts([query], model=model))[0]
     vec_raw = vs.query_vectors(kb_id, query_vec, top_k=max(top_k * 4, 20))
@@ -116,7 +134,7 @@ async def hybrid_search(
             }
         )
     return out
-
+    '''
 
 SYSTEM_PROMPT = """你是企业知识库助手。请仅根据「参考资料」回答问题。
 若参考资料不足以回答，请明确说明「根据现有资料无法回答」，不要编造条款或出处。

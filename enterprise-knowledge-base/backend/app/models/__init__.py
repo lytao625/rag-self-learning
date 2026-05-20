@@ -2,7 +2,7 @@ import enum
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, Boolean
 from sqlalchemy import JSON
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -51,6 +51,10 @@ class KnowledgeBase(Base):
     chunk_overlap: Mapped[int] = mapped_column(Integer, default=80)
     created_by: Mapped[str | None] = mapped_column(String(36), ForeignKey("users.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    use_rerank: Mapped[bool] = mapped_column(Boolean, default=True)
+    rerank_top_k: Mapped[int] = mapped_column(Integer, default=5)
+    search_top_k: Mapped[int] = mapped_column(Integer, default=20)
 
     documents: Mapped[list["Document"]] = relationship(
         back_populates="knowledge_base", cascade="all, delete-orphan"

@@ -13,6 +13,9 @@ type KB = {
   embedding_model_id: string;
   chunk_size: number;
   chunk_overlap: number;
+  use_rerank: boolean;
+  rerank_top_k: number;
+  search_top_k: number;
   created_at: string;
 };
 type Doc = {
@@ -62,6 +65,12 @@ const llmInfo = ref({
   openai_api_base: "",
   has_api_key: false,
 });
+const kbConfig = ref({
+  use_rerank: false,
+  rerank_top_k: 5,
+  search_top_k: 20,
+});
+const savingConfig = ref(false);
 const searchQ = ref("");
 const searchResults = ref<unknown[]>([]);
 
@@ -124,6 +133,14 @@ async function loadMessages() {
 }
 
 watch(kbId, async () => {
+  const kb = kbs.value.find((k) => k.id === kbId.value);
+  if (kb) {
+    kbConfig.value = {
+      use_rerank: kb.use_rerank,
+      rerank_top_k: kb.rerank_top_k,
+      search_top_k: kb.search_top_k,
+    };
+  }
   await loadDocs();
   sessionId.value = null;
   messages.value = [];
@@ -243,6 +260,29 @@ async function removeDoc(doc: Doc) {
   await http.delete(`/api/v1/knowledge-bases/${kbId.value}/documents/${doc.id}`);
   await loadDocs();
   ElMessage.success("已删除");
+}
+
+async function saveConfig() {
+  if (!kbId.value || savingConfig.value) return;
+  savingConfig.value = true;
+  try {
+    await http.patch(`/api/v1/knowledge-bases/${kbId.value}`, {
+      use_rerank: kbConfig.value.use_rerank,
+      rerank_top_k: kbConfig.value.rerank_top_k,
+      search_top_k: kbConfig.value.search_top_k,
+    });
+    const kb = kbs.value.find((k) => k.id === kbId.value);
+    if (kb) {
+      kb.use_rerank = kbConfig.value.use_rerank;
+      kb.rerank_top_k = kbConfig.value.rerank_top_k;
+      kb.search_top_k = kbConfig.value.search_top_k;
+    }
+    ElMessage.success("检索配置已保存");
+  } catch {
+    ElMessage.error("保存失败");
+  } finally {
+    savingConfig.value = false;
+  }
 }
 
 async function runSearch() {
@@ -375,6 +415,25 @@ async function runSearch() {
           <el-button size="small" style="margin-top: 6px" @click="runSearch">检索</el-button>
           <pre style="font-size: 11px; max-height: 200px; overflow: auto">{{ JSON.stringify(searchResults, null, 2) }}</pre>
         </el-card>
+        
+        <el-card shadow="never" style="margin-bottom: 8px">
+          <template #header>检索配置</template>
+          <el-form label-width="80px" size="small">
+            <el-form-item label="启用重排序">
+              <el-switch v-model="kbConfig.use_rerank" />
+            </el-form-item>
+            <el-form-item label="重排数量" v-if="kbConfig.use_rerank">
+              <el-input-number v-model="kbConfig.rerank_top_k" :min="1" :max="20" />
+            </el-form-item>
+            <el-form-item label="初始召回数">
+              <el-input-number v-model="kbConfig.search_top_k" :min="5" :max="100" />
+            </el-form-item>
+            <el-form-item>
+              <el-button type="primary" size="small" :loading="savingConfig" @click="saveConfig">保存配置</el-button>
+            </el-form-item>
+          </el-form>
+        </el-card>
+
       </el-aside>
     </el-container>
   </el-container>

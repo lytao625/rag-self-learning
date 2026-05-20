@@ -28,6 +28,9 @@ class KnowledgeBaseCreate(BaseModel):
     embedding_model_id: str = ""
     chunk_size: int = 512
     chunk_overlap: int = 80
+    use_rerank: bool = True
+    rerank_top_k: int = 5
+    search_top_k: int = 20
 
 
 class KnowledgeBaseOut(BaseModel):
@@ -37,9 +40,22 @@ class KnowledgeBaseOut(BaseModel):
     embedding_model_id: str
     chunk_size: int
     chunk_overlap: int
+    use_rerank: bool
+    rerank_top_k: int
+    search_top_k: int
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+# 新增：知识库配置更新模型
+class KnowledgeBaseUpdate(BaseModel):
+    name: Optional[str] = Field(None, max_length=256)
+    description: Optional[str] = None
+    chunk_size: Optional[int] = None
+    chunk_overlap: Optional[int] = None
+    use_rerank: Optional[bool] = None
+    rerank_top_k: Optional[int] = None
+    search_top_k: Optional[int] = None
 
 
 class DocumentOut(BaseModel):

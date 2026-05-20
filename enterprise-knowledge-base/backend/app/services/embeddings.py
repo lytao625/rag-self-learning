@@ -14,7 +14,6 @@ async def embed_texts(texts: list[str], model: str | None = None) -> list[list[f
     headers = {"Authorization": f"Bearer {settings.openai_api_key}"}
     out: list[list[float]] = []
     batch = 32
-    print(f"url:{url}, model:{m}, headers:{headers}")
     async with httpx.AsyncClient(timeout=120.0) as client:
         for i in range(0, len(texts), batch):
             chunk = texts[i : i + batch]

@@ -49,51 +49,59 @@ async def run_ingestion(job_id: str, document_id: str) -> None:
             old_rows = list(res_old.scalars().all())
             if old_rows:
                 vs.delete_ids(doc.knowledge_base_id, [r.id for r in old_rows])
-            for r in old_rows:
-                await db.delete(r)
-            await db.commit()
+                for r in old_rows:
+                    await db.delete(r)
+                await db.commit()
 
-            texts = [c.text for c in chunks]
-            vectors = await embeddings.embed_texts(texts, model=kb.embedding_model_id)
+            # 批量嵌入（分批处理以监控进度）
+            batch_size = 10
+            total_chunks = len(chunks)
+            for i in range(0, total_chunks, batch_size):
+                batch_chunks = chunks[i:i+batch_size]
+                texts = [c.text for c in batch_chunks]
+                vectors = await embeddings.embed_texts(texts, model=kb.embedding_model_id)
 
-            ids: list[str] = []
-            metadatas: list[dict] = []
-            for i, ch in enumerate(chunks):
-                cid = str(uuid.uuid4())
-                ids.append(cid)
-                cr = ChunkRecord(
-                    id=cid,
-                    document_id=document_id,
-                    chunk_index=i,
-                    content=ch.text,
-                    heading_path=ch.heading_path or "",
-                    page=ch.page,
-                    content_hash=hashlib.sha256(ch.text.encode()).hexdigest(),
-                    chroma_id=cid,
-                    embedding_model_id=kb.embedding_model_id,
+                ids: list[str] = []
+                metadatas: list[dict] = []
+                for j, ch in enumerate(batch_chunks):
+                    cid = str(uuid.uuid4())
+                    ids.append(cid)
+                    cr = ChunkRecord(
+                        id=cid,
+                        document_id=document_id,
+                        chunk_index=i+j,
+                        content=ch.text,
+                        heading_path=ch.heading_path or "",
+                        page=ch.page,
+                        content_hash=hashlib.sha256(ch.text.encode()).hexdigest(),
+                        chroma_id=cid,
+                        embedding_model_id=kb.embedding_model_id,
+                    )
+                    db.add(cr)
+                    meta = {
+                        "kb_id": doc.knowledge_base_id,
+                        "document_id": document_id,
+                        "chunk_id": cid,
+                        "filename": doc.filename,
+                        "heading_path": ch.heading_path or "",
+                        "embedding_model_id": kb.embedding_model_id,
+                    }
+                    if ch.page is not None:
+                        meta["page"] = int(ch.page)
+                    metadatas.append(meta)
+
+                await db.commit()
+
+                vs.add_chunks(
+                    doc.knowledge_base_id,
+                    ids=ids,
+                    embeddings=vectors,
+                    documents=texts,
+                    metadatas=metadatas,
                 )
-                db.add(cr)
-                meta: dict = {
-                    "kb_id": doc.knowledge_base_id,
-                    "document_id": document_id,
-                    "chunk_id": cid,
-                    "filename": doc.filename,
-                    "heading_path": ch.heading_path or "",
-                    "embedding_model_id": kb.embedding_model_id,
-                }
-                if ch.page is not None:
-                    meta["page"] = int(ch.page)
-                metadatas.append(meta)
 
-            await db.commit()
-
-            vs.add_chunks(
-                doc.knowledge_base_id,
-                ids=ids,
-                embeddings=vectors,
-                documents=texts,
-                metadatas=metadatas,
-            )
+                job.progress = 50 + int((i + batch_size) / total_chunks * 50)
+                await db.commit()
 
             job.status = JobStatus.done.value
             job.progress = 100

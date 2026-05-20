@@ -11,7 +11,7 @@ from app.core.config import get_settings
 from app.core.deps import get_current_user, require_kb_admin, require_kb_write
 from app.db.session import get_db
 from app.models import ChunkRecord, Document, IngestionJob, JobStatus, KnowledgeBase, User
-from app.schemas.common import DocumentOut, JobOut, KnowledgeBaseCreate, KnowledgeBaseOut
+from app.schemas.common import DocumentOut, JobOut, KnowledgeBaseCreate, KnowledgeBaseOut, KnowledgeBaseUpdate
 from app.services import parser
 from app.services.ingestion import run_ingestion
 from app.services import vector_store as vs
@@ -45,6 +45,9 @@ async def create_kb(
         chunk_size=body.chunk_size,
         chunk_overlap=body.chunk_overlap,
         created_by=user.id,
+        use_rerank=body.use_rerank,
+        rerank_top_k=body.rerank_top_k,
+        search_top_k=body.search_top_k,
     )
     db.add(kb)
     await db.commit()
@@ -89,6 +92,35 @@ async def delete_kb(
         ip=request.client.host if request.client else None,
     )
     return {"ok": True}
+
+
+@router.patch("/{kb_id}", response_model=KnowledgeBaseOut)
+async def update_kb(
+    request: Request,
+    kb_id: str,
+    body: KnowledgeBaseUpdate,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(require_kb_admin)],
+):
+    tid = get_trace_id(request)
+    kb = await db.get(KnowledgeBase, kb_id)
+    if not kb:
+        raise api_error("KB_NOT_FOUND", "知识库不存在", status_code=404, trace_id=tid)
+    update_data = body.model_dump(exclude_unset=True)
+    for key, value in update_data.items():
+        setattr(kb, key, value)
+    await db.commit()
+    await db.refresh(kb)
+    await write_audit(
+        db,
+        user_id=user.id,
+        action="kb_update",
+        resource_type="knowledge_base",
+        resource_id=kb_id,
+        detail=update_data,
+        ip=request.client.host if request.client else None,
+    )
+    return kb
 
 
 @router.get("/{kb_id}/documents", response_model=list[DocumentOut])
@@ -155,7 +187,11 @@ async def upload_doc(
     )
     db.add(doc)
     await db.flush()
-    job = IngestionJob(document_id=doc.id, status=JobStatus.pending.value, progress=0)
+    job = IngestionJob(
+        document_id=doc.id, 
+        status=JobStatus.pending.value, 
+        progress=0
+    )
     db.add(job)
     await db.commit()
     await db.refresh(job)
